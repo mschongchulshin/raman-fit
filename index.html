@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Raman Peak Fitting</title>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.27.0/full/pyodide.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 1280px; margin: 20px auto; padding: 20px; color: #222; }
+  h1 { margin-bottom: 8px; }
+  .controls { display: flex; gap: 10px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+  button { padding: 8px 14px; cursor: pointer; border: 1px solid #888; background: #fafafa; border-radius: 4px; font-size: 14px; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.active { background: #ffe4b5; border-color: #d4a017; }
+  #status { font-size: 13px; color: #555; margin: 8px 0; padding: 6px 10px; background: #f4f4f4; border-radius: 4px; }
+  #status.err { background: #fee; color: #b00; }
+  #plot { width: 100%; height: 620px; }
+  .help { font-size: 13px; color: #666; margin-bottom: 8px; line-height: 1.5; }
+  .help b { color: #c00; }
+  table { border-collapse: collapse; margin-top: 15px; font-size: 13px; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: right; }
+  th { background: #f5f5f5; }
+  td:first-child { text-align: center; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>Raman Peak Fitting</h1>
+<div class="help">
+  <b>1) xlsx 업로드 → Run</b> → 자동 검출/피팅<br>
+  <b>■ 편집</b><br>
+  &nbsp;&nbsp;· anchor 빨간 ● 점 <b>좌클릭 드래그</b> → baseline 조정 · peak ▼ <b>드래그</b> → center 이동<br>
+  &nbsp;&nbsp;· <b>우클릭</b>: 위 패널→anchor 제거 / 아래 패널→peak 제거<br>
+  &nbsp;&nbsp;· <b>Add Anchor Mode</b> ON 후 위 패널 클릭→anchor 추가 · <b>Add Peak Mode</b> ON 후 아래 클릭→peak 추가<br>
+  <b>■ 그래프 보기 (Plotly 기본)</b><br>
+  &nbsp;&nbsp;· <b>드래그(빈 영역)</b> → 박스 줌 · <b>더블클릭</b> → 줌 리셋(전체 보기)<br>
+  &nbsp;&nbsp;· <b>마우스 휠 / 축 위 드래그</b> → 확대·축소 · 우상단 툴바로 pan/zoom/저장 전환<br>
+  &nbsp;&nbsp;· ※ 편집(드래그·우클릭)과 줌이 헷갈리면, 줌은 <b>그래프 빈 영역</b>에서만 하세요
+</div>
+
+<div class="controls">
+  <input type="file" id="fileInput" accept=".xlsx" disabled>
+  <button id="runBtn" disabled>Run Analysis</button>
+  <label style="margin-left:10px;font-size:13px;">Anchor 민감도:
+    <input type="range" id="lamSlider" min="1" max="15" step="0.5" value="4" style="vertical-align:middle;">
+    <span id="lamVal">4.0</span>
+  </label>
+  <label style="font-size:13px;">민감도 (SNR):
+    <input type="range" id="snrSlider" min="3" max="50" step="0.5" value="20" style="vertical-align:middle;">
+    <span id="snrVal">20.0</span>
+  </label>
+  <button id="anchorModeBtn" disabled>Add Anchor Mode</button>
+  <button id="addModeBtn" disabled>Add Peak Mode</button>
+  <button id="resetBtn" disabled>Reset to Auto</button>
+  <button id="csvBtn" disabled>Download CSV</button>
+  <button id="svgBtn" disabled>Download SVG</button>
+</div>
+
+<div id="status">Loading Pyodide runtime...</div>
+<div id="plot"></div>
+<table id="resultsTable"></table>
+
+<script>
+let pyodide = null;
+let addMode = false;
+let anchorMode = false;
+let clickHandlerAttached = false;
+
+const PY_CODE = `
+import io, json
+import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
+from scipy.optimize import curve_fit
+from scipy.signal import find_peaks, savgol_filter
+
+state = {}
+
+def pvoigt(x, amp, cen, sig, eta):
+    g = np.exp(-(x - cen)**2 / (2 * sig**2))
+    l = 1.0 / (1.0 + ((x - cen)/sig)**2)
+    return amp * (eta * l + (1 - eta) * g)
+
+def multi_pv(x, *p):
+    n = len(p) // 4
+    return sum(pvoigt(x, p[4*i], p[4*i+1], p[4*i+2], p[4*i+3]) for i in range(n))
+
+def fit_once(centers, y_sub, x, noise):
+    if not centers: return None
+    p0, lo, hi = make_bounds(centers, y_sub, x, noise)
+    try:
+        popt, _ = curve_fit(multi_pv, x, y_sub, p0=p0, bounds=(lo, hi), maxfev=100000)
+        return popt
+    except Exception as e:
+        print('fit error:', e); return None
+
+def make_bounds(centers, y_sub, x, noise):
+    amp_fix = state.get('amp_fix', {})
+    p0, lo, hi = [], [], []
+    for c in centers:
+        idx = int(np.argmin(np.abs(x - c)))
+        py = max(float(y_sub[idx]), float(noise))
+        af = None
+        for fc, fv in amp_fix.items():
+            if abs(fc - c) < 1.5 and fv > 0:
+                af = float(fv); break
+        if af is not None:
+            p0 += [af, float(c), 3.0, 0.7]
+            lo += [af*0.999, float(c)-3, 1.2, 0.0]
+            hi += [af*1.001 + 1e-6, float(c)+3, 18.0, 1.0]
+        else:
+            p0 += [py, float(c), 3.0, 0.7]
+            lo += [0.0, float(c)-3, 1.2, 0.0]
+            hi += [py*8 + noise*10, float(c)+3, 18.0, 1.0]
+    return p0, lo, hi
+
+def run_pipeline(file_bytes, snr=8.0, anchor_density=4.0):
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    df.columns = ['shift', 'intensity']
+    df = df.sort_values('shift').reset_index(drop=True)
+    x = df['shift'].to_numpy(dtype=float)
+    y = df['intensity'].to_numpy(dtype=float)
+    N = len(x); dx = float(np.median(np.diff(x)))
+
+    hp = y - savgol_filter(y, 11, 3)
+    noise = float(1.4826 * np.median(np.abs(hp - np.median(hp))))
+
+    valley_win = max(11, int(25.0/dx) | 1)
+    y_heavy = savgol_filter(y, valley_win, 2)
+    valley_idx, _ = find_peaks(-y_heavy, prominence=anchor_density*noise,
+                               distance=max(8, int(30.0/dx)))
+    anchor_set = set([0] + list(int(i) for i in valley_idx) + [N-1])
+    anchor_win = max(3, int(5.0/dx))
+
+    def build_bl(aset):
+        idx = sorted(aset)
+        ax = np.array([x[i] for i in idx])
+        ay = np.array([y[max(0,i-anchor_win):min(N,i+anchor_win+1)].min() for i in idx])
+        return idx, ax, ay, interp1d(ax, ay, kind='linear', fill_value='extrapolate')(x)
+
+    ai, ax_a, ay_a, baseline = build_bl(anchor_set)
+    y_sub = y - baseline
+    state['anchor_set'] = {int(i): float(y[max(0,i-anchor_win):min(N,i+anchor_win+1)].min()) for i in anchor_set}
+    state['anchor_win'] = anchor_win
+
+    smooth_win = max(5, int(3.0/dx) | 1)
+    y_ss = savgol_filter(y_sub, smooth_win, 2)
+    peak_dist = max(3, int(5.0/dx))
+    peak_idx, _ = find_peaks(y_ss, prominence=snr*noise, distance=peak_dist)
+    centers = [float(c) for c in x[peak_idx]]
+
+    popt = fit_once(centers, y_sub, x, noise)
+    resid_snr = max(snr, 8.0)
+    for _ in range(3):
+        if popt is None: break
+        yf = multi_pv(x, *popt)
+        r = y_sub - yf
+        rs = savgol_filter(r, smooth_win, 2)
+        ei, _ = find_peaks(rs, prominence=resid_snr*noise, distance=peak_dist)
+        extra = [float(x[i]) for i in ei if all(abs(x[i]-c) > 4.0 for c in centers)]
+        if not extra: break
+        centers = sorted(centers + extra)
+        popt = fit_once(centers, y_sub, x, noise)
+
+    prune_snr = max(snr * 0.6, 4.0)
+    if popt is not None:
+        n = len(popt) // 4
+        keep = []
+        for i in range(n):
+            amp = popt[4*i]; sig = popt[4*i+2]
+            fwhm = 2*sig
+            if amp > prune_snr * noise and fwhm > 2.5:
+                keep.append(float(popt[4*i+1]))
+        if len(keep) < n:
+            centers = keep
+            popt = fit_once(centers, y_sub, x, noise)
+
+    state['x'] = x; state['y'] = y; state['y_sub'] = y_sub
+    state['baseline'] = baseline; state['noise'] = noise
+    if popt is None:
+        state['popt'] = np.array([])
+        state['centers'] = []
+    else:
+        state['popt'] = popt
+        state['centers'] = sorted([float(popt[4*i+1]) for i in range(len(popt)//4)])
+    state['centers_auto'] = list(state['centers'])
+    return get_plot_data()
+
+def refit():
+    x = state['x']; y_sub = state['y_sub']; noise = state['noise']
+    if not state['centers']:
+        state['popt'] = np.array([])
+        return get_plot_data()
+    popt = fit_once(state['centers'], y_sub, x, noise)
+    if popt is None:
+        state['popt'] = np.array([])
+        return get_plot_data()
+    state['popt'] = popt
+    state['centers'] = sorted([float(popt[4*i+1]) for i in range(len(popt)//4)])
+    return get_plot_data()
+
+def rebuild_baseline_and_refit():
+    x = state['x']; N = len(x)
+    aset = state['anchor_set']
+    if len(aset) < 2: return None
+    idx = sorted(aset.keys())
+    ax_a = np.array([float(x[i]) for i in idx])
+    ay_a = np.array([float(aset[i]) for i in idx])
+    baseline = interp1d(ax_a, ay_a, kind='linear', fill_value='extrapolate')(x)
+    state['baseline'] = baseline
+    state['y_sub'] = state['y'] - baseline
+    return refit()
+
+def add_anchor(cm):
+    x = state['x']; y = state['y']; N = len(x)
+    aw = state['anchor_win']
+    i = int(np.argmin(np.abs(x - cm)))
+    if i in state['anchor_set']: return None
+    yv = float(y[max(0,i-aw):min(N,i+aw+1)].min())
+    state['anchor_set'][i] = yv
+    return rebuild_baseline_and_refit()
+
+def remove_anchor_near(cm, tol=10.0):
+    x = state['x']; N = len(x)
+    aset = state['anchor_set']
+    cand = [i for i in aset.keys() if i != 0 and i != N-1]
+    if not cand: return None
+    dists = [abs(float(x[i]) - cm) for i in cand]
+    j = int(np.argmin(dists))
+    if dists[j] > tol: return None
+    del aset[cand[j]]
+    return rebuild_baseline_and_refit()
+
+def update_anchor_y(cm, new_y, tol=5.0):
+    x = state['x']
+    aset = state['anchor_set']
+    keys = list(aset.keys())
+    if not keys: return None
+    dists = [abs(float(x[i]) - cm) for i in keys]
+    j = int(np.argmin(dists))
+    if dists[j] > tol: return None
+    aset[keys[j]] = float(new_y)
+    return rebuild_baseline_and_refit()
+
+def move_anchor(old_x, new_x, new_y, tol=40.0):
+    x = state['x']
+    aset = state['anchor_set']
+    keys = list(aset.keys())
+    if not keys: return None
+    dists = [abs(float(x[i]) - old_x) for i in keys]
+    j = int(np.argmin(dists))
+    if dists[j] > tol: return None
+    old_i = keys[j]
+    new_i = int(np.argmin(np.abs(x - new_x)))
+    if new_i != old_i and new_i in aset:
+        return None
+    del aset[old_i]
+    aset[new_i] = float(new_y)
+    return rebuild_baseline_and_refit()
+
+def remove_peak_near(cm, tol=15.0):
+    if not state.get('centers'): return None
+    centers = state['centers']
+    dists = [abs(c - cm) for c in centers]
+    j = int(np.argmin(dists))
+    if dists[j] > tol: return None
+    centers.pop(j)
+    return refit()
+
+def add_peak(cm):
+    if 'centers' not in state or state.get('x') is None: return None
+    if any(abs(c - cm) < 2.5 for c in state['centers']): return None
+    if cm < float(state['x'].min()) or cm > float(state['x'].max()): return None
+    state['centers'] = sorted(state['centers'] + [float(cm)])
+    return refit()
+
+def move_peak(old_x, new_x, new_y=-1.0, tol=30.0):
+    centers = state.get('centers', [])
+    if not centers: return None
+    dists = [abs(c - old_x) for c in centers]
+    j = int(np.argmin(dists))
+    if dists[j] > tol: return None
+    if new_x < float(state['x'].min()) or new_x > float(state['x'].max()): return None
+    if any(abs(c - new_x) < 2.5 for k,c in enumerate(centers) if k != j): return None
+    old_c = centers[j]
+    centers[j] = float(new_x)
+    state['centers'] = sorted(centers)
+    if 'amp_fix' not in state: state['amp_fix'] = {}
+    state['amp_fix'] = {fc:fv for fc,fv in state['amp_fix'].items() if abs(fc-old_c) >= 1.5}
+    if new_y is not None and new_y > 0:
+        state['amp_fix'][float(new_x)] = float(new_y)
+    return refit()
+
+def reset_to_auto():
+    state['centers'] = list(state.get('centers_auto', []))
+    state['amp_fix'] = {}
+    return refit()
+
+def get_plot_data():
+    x = state['x']; y_sub = state['y_sub']; popt = state['popt']
+    n = len(popt)//4
+    centers_y, components = [], []
+    order = sorted(range(n), key=lambda i: popt[4*i+1])
+    rows = []
+    for k, i in enumerate(order):
+        a,c,s,e = popt[4*i:4*i+4]
+        comp = pvoigt(x, a, c, s, e)
+        components.append({'y': comp.tolist(), 'center': float(c)})
+        centers_y.append(float(a))
+        fwhm = e*2*s + (1-e)*2*np.sqrt(2*np.log(2))*s
+        area = a * (e*np.pi*s + (1-e)*s*np.sqrt(2*np.pi))
+        rows.append({'idx': k+1, 'center': float(c), 'fwhm': float(fwhm),
+                     'height': float(a), 'eta': float(e), 'area': float(area)})
+    total_area = sum(r['area'] for r in rows) or 1
+    for r in rows: r['area_pct'] = 100*r['area']/total_area
+    y_fit = multi_pv(x, *popt) if n > 0 else np.zeros_like(x)
+    resid = y_sub - y_fit
+    centers_sorted = [popt[4*i+1] for i in order]
+    aset = state.get('anchor_set', {})
+    aidx = sorted(aset.keys())
+    anchor_x_a = [float(x[i]) for i in aidx]
+    anchor_y_a = [float(aset[i]) for i in aidx]
+    return json.dumps({
+        'x': x.tolist(),
+        'y_raw': state['y'].tolist(),
+        'baseline': state['baseline'].tolist(),
+        'anchor_x': anchor_x_a,
+        'anchor_y': anchor_y_a,
+        'y_sub': y_sub.tolist(),
+        'y_fit': y_fit.tolist(),
+        'resid': resid.tolist(),
+        'components': components,
+        'centers_x': [float(c) for c in centers_sorted],
+        'centers_y': centers_y,
+        'noise': float(state['noise']),
+        'rows': rows,
+    })
+
+def get_csv():
+    d = json.loads(get_plot_data())
+    out = 'Peak,Center,FWHM,Height,eta_L,Area,Area_pct\\n'
+    for r in d['rows']:
+        out += f"{r['idx']},{r['center']:.4f},{r['fwhm']:.4f},{r['height']:.2f},{r['eta']:.3f},{r['area']:.2f},{r['area_pct']:.3f}\\n"
+    return out
+`;
+
+async function setup() {
+  setStatus('Pyodide 다운로드 중...');
+  pyodide = await loadPyodide();
+  setStatus('scipy / numpy / pandas 로딩 중 (~30초, 첫 실행만)...');
+  await pyodide.loadPackage(['numpy', 'scipy', 'pandas', 'micropip']);
+  setStatus('openpyxl 설치 중...');
+  await pyodide.runPythonAsync(`
+import micropip
+await micropip.install('openpyxl')
+`);
+  setStatus('초기화 중...');
+  pyodide.runPython(PY_CODE);
+  setStatus('준비 완료. xlsx 파일을 업로드하세요.');
+  document.getElementById('fileInput').disabled = false;
+}
+
+function setStatus(msg, isErr) {
+  const s = document.getElementById('status');
+  s.textContent = msg;
+  s.classList.toggle('err', !!isErr);
+}
+
+function plotData(data) {
+  window._lastAnchorX = data.anchor_x.slice();
+  const traces = [
+    { x: data.x, y: data.y_raw, mode: 'lines', name: 'raw',
+      line: {color: 'black', width: 1.0}, yaxis: 'y3' },
+    { x: data.x, y: data.baseline, mode: 'lines', name: 'baseline',
+      line: {color: 'red', width: 1.5}, yaxis: 'y3' },
+    { x: data.anchor_x, y: data.anchor_y, mode: 'markers',
+      name: 'anchor (클릭→제거)',
+      marker: {color: 'red', size: 12, symbol: 'circle', line: {color:'white',width:1.5}},
+      hovertemplate: 'anchor x=%{x:.1f}, y=%{y:.0f}<extra>드래그로 위치 조정</extra>',
+      yaxis: 'y3' },
+    { x: data.x, y: data.y_sub, mode: 'lines', name: 'data',
+      line: {color: 'black', width: 1.0}, yaxis: 'y' },
+    { x: data.x, y: data.y_fit, mode: 'lines', name: 'fit',
+      line: {color: 'red', width: 2}, yaxis: 'y' },
+  ];
+  for (const c of data.components) {
+    traces.push({ x: data.x, y: c.y, mode: 'lines', showlegend: false,
+      line: {color: 'rgba(0,180,200,0.7)', width: 1}, hoverinfo: 'skip', yaxis: 'y' });
+  }
+  window._nAnchor = data.anchor_x.length;
+  window._lastPeakX = data.centers_x.slice();
+  const anchorAnn = data.anchor_x.map((xv, i) => ({
+    x: xv, y: data.anchor_y[i], xref: 'x', yref: 'y3',
+    text: '●', showarrow: false,
+    font: {color: 'rgba(220,0,0,0.95)', size: 22},
+    captureevents: true,
+  }));
+  const peakAnn = data.centers_x.map((xv, i) => ({
+    x: xv, y: data.centers_y[i], xref: 'x', yref: 'y',
+    text: `${i+1}<br>▼`, showarrow: false,
+    align: 'center',
+    font: {color: 'red', size: 15, weight: 'bold'},
+    captureevents: true,
+  }));
+  const annotations = anchorAnn.concat(peakAnn);
+
+  const layout = {
+    yaxis3: {domain: [0.55, 1.0], title: 'Raw + baseline'},
+    yaxis:  {domain: [0, 0.48], title: 'Subtracted intensity'},
+    xaxis:  {title: 'Raman shift (cm⁻¹)', anchor: 'y'},
+    margin: {t: 30, b: 60, l: 60, r: 20},
+    hovermode: 'closest',
+    showlegend: true,
+    legend: {orientation: 'h', y: 1.06},
+    annotations: annotations,
+  };
+
+  const config = {
+    responsive: true, displaylogo: false,
+    editable: true,
+    edits: { annotationPosition: true, annotationTail: false, axisTitleText: false,
+             legendPosition: false, legendText: false, shapePosition: false, titleText: false },
+  };
+
+  Plotly.react('plot', traces, layout, config).then(() => {
+    const div = document.getElementById('plot');
+    if (!clickHandlerAttached) {
+      div.on('plotly_click', onPlotClick);
+      div.on('plotly_relayout', onPlotRelayout);
+      div.addEventListener('contextmenu', onContextMenu);
+      clickHandlerAttached = true;
+    }
+  });
+}
+
+let relayoutBusy = false;
+async function onPlotRelayout(ev) {
+  if (relayoutBusy) return;
+  const updates = {};
+  for (const key of Object.keys(ev)) {
+    const m = key.match(/^annotations\[(\d+)\]\.(x|y)$/);
+    if (!m) continue;
+    const idx = parseInt(m[1]);
+    updates[idx] = updates[idx] || {};
+    updates[idx][m[2]] = ev[key];
+  }
+  const indices = Object.keys(updates);
+  if (indices.length === 0) return;
+  relayoutBusy = true;
+  try {
+    const nA = window._nAnchor || 0;
+    const allAnn = gdLayout().annotations || [];
+    for (const idxStr of indices) {
+      const idx = parseInt(idxStr);
+      const ann = allAnn[idx] || {};
+      let json, msg;
+      if (idx < nA) {
+        const origX = window._lastAnchorX[idx];
+        if (origX === undefined) continue;
+        const newX = (ann.x !== undefined) ? ann.x : origX;
+        const newY = ann.y;
+        if (newY === undefined || newY === null) continue;
+        json = pyodide.runPython(`move_anchor(${origX}, ${newX}, ${newY})`);
+        msg = `anchor 이동 → x=${(+newX).toFixed(1)}, y=${(+newY).toFixed(0)}`;
+      } else {
+        const pidx = idx - nA;
+        const origX = window._lastPeakX[pidx];
+        if (origX === undefined) continue;
+        const newX = (ann.x !== undefined) ? ann.x : origX;
+        const newY = (ann.y !== undefined && ann.y !== null) ? ann.y : -1;
+        json = pyodide.runPython(`move_peak(${origX}, ${newX}, ${newY})`);
+        msg = `peak 이동 @ ${origX.toFixed(1)} → x=${(+newX).toFixed(1)}, h=${(+newY).toFixed(0)}`;
+      }
+      if (json) {
+        const data = JSON.parse(json);
+        plotData(data);
+        renderTable(data.rows);
+        setStatus(msg);
+      }
+      break;
+    }
+  } finally {
+    relayoutBusy = false;
+  }
+}
+
+function gdLayout() {
+  const gd = document.getElementById('plot');
+  return (gd && gd.layout) ? gd.layout : {};
+}
+
+async function onPlotClick(ev) {
+  const pt = ev.points[0];
+  const onTop = (pt.data && pt.data.yaxis === 'y3');
+  const cm = pt.x;
+  let json, action;
+  try {
+    if (anchorMode && onTop) {
+      action = `anchor 추가 @ ${cm.toFixed(1)}`;
+      json = pyodide.runPython(`add_anchor(${cm})`);
+    } else if (addMode && !onTop) {
+      action = `peak 추가 @ ${cm.toFixed(1)}`;
+      json = pyodide.runPython(`add_peak(${cm})`);
+    } else {
+      return;
+    }
+  } catch (e) {
+    setStatus('fit 실패: ' + e.message, true); return;
+  }
+  if (json) {
+    const data = JSON.parse(json);
+    plotData(data);
+    renderTable(data.rows);
+    setStatus(`${action} OK · ${data.rows.length}개 peak · ${data.anchor_x.length}개 anchor`);
+  } else {
+    setStatus(`${action} 실패`);
+  }
+}
+
+async function onContextMenu(e) {
+  const gd = document.getElementById('plot');
+  if (!gd._fullLayout || !lastFileBytes) return;
+  e.preventDefault();
+  const bb = gd.getBoundingClientRect();
+  const xpix = e.clientX - bb.left;
+  const ypix = e.clientY - bb.top;
+  const fl = gd._fullLayout;
+  const xa = fl.xaxis;
+  let dataX;
+  try { dataX = xa.p2d(xpix - xa._offset); } catch(_) { return; }
+  const sz = fl._size;
+  const yfrac = 1 - (ypix - sz.t) / sz.h;
+  const inTop = (yfrac >= fl.yaxis3.domain[0]);
+  let json, action;
+  try {
+    if (inTop) {
+      action = `anchor 제거 @ ${dataX.toFixed(1)}`;
+      json = pyodide.runPython(`remove_anchor_near(${dataX})`);
+    } else {
+      action = `peak 제거 @ ${dataX.toFixed(1)}`;
+      json = pyodide.runPython(`remove_peak_near(${dataX})`);
+    }
+  } catch (err) {
+    setStatus('fit 실패: ' + err.message, true); return;
+  }
+  if (json) {
+    const data = JSON.parse(json);
+    plotData(data);
+    renderTable(data.rows);
+    setStatus(`${action} OK · ${data.rows.length}개 peak · ${data.anchor_x.length}개 anchor`);
+  } else {
+    setStatus(`${action} 실패 (가까운 점 없음)`);
+  }
+}
+
+function stddev(arr) {
+  const m = arr.reduce((a,b)=>a+b,0)/arr.length;
+  return Math.sqrt(arr.reduce((s,v)=>s+(v-m)**2,0)/arr.length);
+}
+
+function renderTable(rows) {
+  let h = '<tr><th>#</th><th>Center</th><th>FWHM</th><th>Height</th><th>η (L)</th><th>Area</th><th>Area %</th></tr>';
+  for (const r of rows) {
+    h += `<tr><td>${r.idx}</td><td>${r.center.toFixed(2)}</td><td>${r.fwhm.toFixed(2)}</td><td>${r.height.toFixed(0)}</td><td>${r.eta.toFixed(2)}</td><td>${r.area.toFixed(0)}</td><td>${r.area_pct.toFixed(2)}</td></tr>`;
+  }
+  document.getElementById('resultsTable').innerHTML = h;
+}
+
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  document.getElementById('runBtn').disabled = !e.target.files[0];
+});
+
+let lastFileBytes = null;
+
+async function runAnalysis() {
+  if (!lastFileBytes) return;
+  const snr = parseFloat(document.getElementById('snrSlider').value);
+  const lam = parseFloat(document.getElementById('lamSlider').value);
+  setStatus(`피팅 중... (SNR=${snr.toFixed(1)}, anchor=${lam.toFixed(1)})`);
+  try {
+    pyodide.globals.set('_file_bytes', lastFileBytes);
+    pyodide.globals.set('_snr', snr);
+    pyodide.globals.set('_anc', lam);
+    const json = pyodide.runPython(`run_pipeline(bytes(_file_bytes.to_py()), _snr, _anc)`);
+    const data = JSON.parse(json);
+    plotData(data);
+    renderTable(data.rows);
+    for (const id of ['anchorModeBtn','addModeBtn','resetBtn','csvBtn','svgBtn']) document.getElementById(id).disabled = false;
+    setStatus(`완료 · ${data.rows.length}개 peak · SNR=${snr.toFixed(1)} · σ=${data.noise.toFixed(0)} · resid std/σ=${(stddev(data.resid)/data.noise).toFixed(2)}`);
+  } catch (e) {
+    console.error(e); setStatus('실패: ' + e.message, true);
+  }
+}
+
+document.getElementById('runBtn').addEventListener('click', async () => {
+  const file = document.getElementById('fileInput').files[0];
+  if (!file) return;
+  setStatus('파일 읽는 중...');
+  const buf = await file.arrayBuffer();
+  lastFileBytes = new Uint8Array(buf);
+  await runAnalysis();
+});
+
+let snrDebounce = null;
+function onSliderChange() {
+  document.getElementById('snrVal').textContent = parseFloat(document.getElementById('snrSlider').value).toFixed(1);
+  document.getElementById('lamVal').textContent = parseFloat(document.getElementById('lamSlider').value).toFixed(1);
+  if (!lastFileBytes) return;
+  clearTimeout(snrDebounce);
+  snrDebounce = setTimeout(runAnalysis, 400);
+}
+document.getElementById('snrSlider').addEventListener('input', onSliderChange);
+document.getElementById('lamSlider').addEventListener('input', onSliderChange);
+
+document.getElementById('addModeBtn').addEventListener('click', () => {
+  addMode = !addMode;
+  const b = document.getElementById('addModeBtn');
+  b.textContent = 'Add Peak Mode' + (addMode ? ' (ON)' : '');
+  b.classList.toggle('active', addMode);
+});
+
+document.getElementById('anchorModeBtn').addEventListener('click', () => {
+  anchorMode = !anchorMode;
+  const b = document.getElementById('anchorModeBtn');
+  b.textContent = 'Add Anchor Mode' + (anchorMode ? ' (ON)' : '');
+  b.classList.toggle('active', anchorMode);
+});
+
+document.getElementById('resetBtn').addEventListener('click', () => {
+  setStatus('자동 검출 결과로 복귀 중...');
+  try {
+    const json = pyodide.runPython('reset_to_auto()');
+    const data = JSON.parse(json);
+    plotData(data); renderTable(data.rows);
+    setStatus(`Reset 완료 · ${data.rows.length}개 peak`);
+  } catch(e) { setStatus('Reset 실패: '+e.message, true); }
+});
+
+document.getElementById('csvBtn').addEventListener('click', () => {
+  const csv = pyodide.runPython('get_csv()');
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'fit_results.csv'; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+});
+
+document.getElementById('svgBtn').addEventListener('click', () => {
+  Plotly.downloadImage('plot', {format:'svg', filename:'raman_fit', width:1280, height:620});
+});
+
+setup().catch(e => setStatus('초기화 실패: ' + e.message, true));
+</script>
+
+</body>
+</html>
