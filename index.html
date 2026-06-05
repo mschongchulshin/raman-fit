@@ -413,11 +413,6 @@ function plotData(data) {
       line: {color: 'black', width: 1.0}, yaxis: 'y3' },
     { x: data.x, y: data.baseline, mode: 'lines', name: 'baseline',
       line: {color: 'red', width: 1.5}, yaxis: 'y3' },
-    { x: data.anchor_x, y: data.anchor_y, mode: 'markers',
-      name: 'anchor (클릭→제거)',
-      marker: {color: 'red', size: 12, symbol: 'circle', line: {color:'white',width:1.5}},
-      hovertemplate: 'anchor x=%{x:.1f}, y=%{y:.0f}<extra>드래그로 위치 조정</extra>',
-      yaxis: 'y3' },
     { x: data.x, y: data.y_sub, mode: 'lines', name: 'data',
       line: {color: 'black', width: 1.0}, yaxis: 'y' },
     { x: data.x, y: data.y_fit, mode: 'lines', name: 'fit',
@@ -439,7 +434,9 @@ function plotData(data) {
     x: xv, y: data.centers_y[i], xref: 'x', yref: 'y',
     text: `${i+1}<br>▼`, showarrow: false,
     align: 'center',
-    font: {color: 'red', size: 15, weight: 'bold'},
+    yanchor: 'bottom',
+    yshift: 6,
+    font: {color: 'red', size: 14, weight: 'bold'},
     captureevents: true,
   }));
   const annotations = anchorAnn.concat(peakAnn);
