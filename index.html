@@ -56,7 +56,6 @@
   <button id="graphCsvBtn" disabled>Graph data CSV</button>
   <button id="xlsxBtn" disabled>All data XLSX</button>
   <button id="svgBtn" disabled>Figure SVG</button>
-  <button id="srcBtn">Source HTML</button>
 </div>
 
 <div id="status">Loading Pyodide runtime...</div>
@@ -743,19 +742,6 @@ document.getElementById('xlsxBtn').addEventListener('click', () => {
     setStatus('xlsx 저장 완료');
   } catch (e) {
     setStatus('xlsx 실패: ' + e.message, true);
-  }
-});
-
-document.getElementById('srcBtn').addEventListener('click', async () => {
-  try {
-    const r = await fetch(location.href.split('#')[0].split('?')[0]);
-    const html = await r.text();
-    const blob = new Blob([html], {type: 'text/html;charset=utf-8'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = 'raman_fit.html'; a.click();
-    setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
-  } catch (e) {
-    setStatus('소스 다운로드 실패: ' + e.message, true);
   }
 });
 
