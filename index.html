@@ -308,7 +308,9 @@ def get_plot_data():
         a,c,s,e = popt[4*i:4*i+4]
         comp = pvoigt(x, a, c, s, e)
         components.append({'y': comp.tolist(), 'center': float(c)})
-        centers_y.append(float(a))
+        idx = int(np.argmin(np.abs(x - c)))
+        data_y = float(y_sub[idx])
+        centers_y.append(max(float(a), data_y))
         fwhm = e*2*s + (1-e)*2*np.sqrt(2*np.log(2))*s
         area = a * (e*np.pi*s + (1-e)*s*np.sqrt(2*np.pi))
         rows.append({'idx': k+1, 'center': float(c), 'fwhm': float(fwhm),
