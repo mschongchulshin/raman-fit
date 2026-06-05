@@ -52,10 +52,11 @@
   <button id="anchorModeBtn" disabled>Add Anchor Mode</button>
   <button id="addModeBtn" disabled>Add Peak Mode</button>
   <button id="resetBtn" disabled>Reset to Auto</button>
-  <button id="csvBtn" disabled>Download peaks (CSV)</button>
-  <button id="xlsxBtn" disabled>Download all data (XLSX)</button>
-  <button id="svgBtn" disabled>Download figure (SVG)</button>
-  <button id="srcBtn">Download source (HTML)</button>
+  <button id="csvBtn" disabled>Peaks CSV</button>
+  <button id="graphCsvBtn" disabled>Graph data CSV</button>
+  <button id="xlsxBtn" disabled>All data XLSX</button>
+  <button id="svgBtn" disabled>Figure SVG</button>
+  <button id="srcBtn">Source HTML</button>
 </div>
 
 <div id="status">Loading Pyodide runtime...</div>
@@ -345,43 +346,75 @@ def get_csv():
         out += f"{r['idx']},{r['center']:.4f},{r['fwhm']:.4f},{r['height']:.2f},{r['eta']:.3f},{r['area']:.2f},{r['area_pct']:.3f}\\n"
     return out
 
-def get_xlsx_bytes():
-    if state.get('x') is None: return None
-    buf = io.BytesIO()
+def _build_curves():
     x = state['x']; y = state['y']; bl = state['baseline']; ys = state['y_sub']
     popt = state.get('popt', np.array([]))
     n = len(popt)//4
     y_fit = multi_pv(x, *popt) if n > 0 else np.zeros_like(x)
     resid = ys - y_fit
+    all_d = {'shift_cm-1': x, 'raw': y, 'baseline': bl, 'subtracted': ys,
+             'fit': y_fit, 'residual': resid}
+    peak_rows, comps = [], {}
+    total = 0.0
+    if n > 0:
+        order = sorted(range(n), key=lambda i: popt[4*i+1])
+        for k, i in enumerate(order):
+            a,c,s,e = popt[4*i:4*i+4]
+            col = f'peak{k+1}_c{c:.1f}'
+            comp = pvoigt(x, a, c, s, e)
+            all_d[col] = comp
+            comps[col] = comp
+            fwhm = e*2*s + (1-e)*2*np.sqrt(2*np.log(2))*s
+            area = a*(e*np.pi*s + (1-e)*s*np.sqrt(2*np.pi))
+            peak_rows.append({'Peak': k+1, 'Center_cm-1': float(c), 'FWHM': float(fwhm),
+                              'Height': float(a), 'eta_L': float(e), 'Area': float(area)})
+            total += area
+        for r in peak_rows:
+            r['Area_pct'] = 100*r['Area']/total if total else 0.0
+    return all_d, comps, peak_rows, y_fit, resid
+
+def get_xlsx_bytes():
+    if state.get('x') is None: return None
+    buf = io.BytesIO()
+    x = state['x']; y = state['y']; bl = state['baseline']; ys = state['y_sub']
+    noise = state.get('noise', 0.0)
+    all_d, comps, peak_rows, y_fit, resid = _build_curves()
     with pd.ExcelWriter(buf, engine='openpyxl') as w:
+        pd.DataFrame(all_d).to_excel(w, sheet_name='all_curves', index=False)
+        if peak_rows:
+            pd.DataFrame(peak_rows).to_excel(w, sheet_name='peaks', index=False)
         pd.DataFrame({'shift_cm-1': x, 'raw_intensity': y}).to_excel(w, sheet_name='raw', index=False)
         pd.DataFrame({'shift_cm-1': x, 'baseline': bl}).to_excel(w, sheet_name='baseline', index=False)
         pd.DataFrame({'shift_cm-1': x, 'subtracted': ys}).to_excel(w, sheet_name='subtracted', index=False)
         pd.DataFrame({'shift_cm-1': x, 'fit': y_fit, 'residual': resid}).to_excel(w, sheet_name='fit', index=False)
-        if n > 0:
-            order = sorted(range(n), key=lambda i: popt[4*i+1])
-            comps = {'shift_cm-1': x}
-            rows = []
-            total = 0.0
-            tmp = []
-            for k, i in enumerate(order):
-                a,c,s,e = popt[4*i:4*i+4]
-                comps[f'peak{k+1}_c{c:.1f}'] = pvoigt(x, a, c, s, e)
-                fwhm = e*2*s + (1-e)*2*np.sqrt(2*np.log(2))*s
-                area = a*(e*np.pi*s + (1-e)*s*np.sqrt(2*np.pi))
-                tmp.append((k+1, float(c), float(fwhm), float(a), float(e), float(area)))
-                total += area
-            pd.DataFrame(comps).to_excel(w, sheet_name='components', index=False)
-            for k,c,f,a,e,ar in tmp:
-                rows.append({'Peak': k, 'Center_cm-1': c, 'FWHM': f, 'Height': a,
-                             'eta_L': e, 'Area': ar, 'Area_pct': 100*ar/total if total else 0})
-            pd.DataFrame(rows).to_excel(w, sheet_name='peaks', index=False)
+        if comps:
+            cdf = {'shift_cm-1': x}; cdf.update(comps)
+            pd.DataFrame(cdf).to_excel(w, sheet_name='components', index=False)
         aset = state.get('anchor_set', {})
         if aset:
             aidx = sorted(aset.keys())
             pd.DataFrame({'anchor_x_cm-1': [float(x[i]) for i in aidx],
                           'anchor_y': [float(aset[i]) for i in aidx]}).to_excel(w, sheet_name='anchors', index=False)
+        meta = pd.DataFrame({
+            'key': ['n_points', 'x_min', 'x_max', 'dx_median', 'noise_sigma',
+                    'n_peaks', 'n_anchors',
+                    'residual_std', 'residual_std_over_noise'],
+            'value': [len(x), float(x.min()), float(x.max()), float(np.median(np.diff(x))),
+                      float(noise), len(peak_rows), len(aset),
+                      float(np.std(resid)), float(np.std(resid)/noise) if noise else 0.0]
+        })
+        meta.to_excel(w, sheet_name='metadata', index=False)
     return buf.getvalue()
+
+def get_graph_csv():
+    if state.get('x') is None: return None
+    all_d, _, _, _, _ = _build_curves()
+    cols = list(all_d.keys())
+    out = ','.join(cols) + '\\n'
+    n = len(all_d[cols[0]])
+    for i in range(n):
+        out += ','.join(f'{float(all_d[c][i]):.6g}' for c in cols) + '\\n'
+    return out
 `;
 
 async function setup() {
@@ -622,7 +655,7 @@ async function runAnalysis() {
     const data = JSON.parse(json);
     plotData(data);
     renderTable(data.rows);
-    for (const id of ['anchorModeBtn','addModeBtn','resetBtn','csvBtn','xlsxBtn','svgBtn']) document.getElementById(id).disabled = false;
+    for (const id of ['anchorModeBtn','addModeBtn','resetBtn','csvBtn','graphCsvBtn','xlsxBtn','svgBtn']) document.getElementById(id).disabled = false;
     setStatus(`완료 · ${data.rows.length}개 peak · SNR=${snr.toFixed(1)} · σ=${data.noise.toFixed(0)} · resid std/σ=${(stddev(data.resid)/data.noise).toFixed(2)}`);
   } catch (e) {
     console.error(e); setStatus('실패: ' + e.message, true);
@@ -683,6 +716,18 @@ document.getElementById('csvBtn').addEventListener('click', () => {
 
 document.getElementById('svgBtn').addEventListener('click', () => {
   Plotly.downloadImage('plot', {format:'svg', filename:'raman_fit', width:1280, height:620});
+});
+
+document.getElementById('graphCsvBtn').addEventListener('click', () => {
+  try {
+    const csv = pyodide.runPython('get_graph_csv()');
+    if (!csv) { setStatus('데이터 없음', true); return; }
+    const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'raman_graph_data.csv'; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+    setStatus('그래프 CSV 저장 완료');
+  } catch (e) { setStatus('그래프 CSV 실패: '+e.message, true); }
 });
 
 document.getElementById('xlsxBtn').addEventListener('click', () => {
